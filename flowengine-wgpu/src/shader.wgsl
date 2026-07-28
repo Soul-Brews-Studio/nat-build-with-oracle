@@ -1,65 +1,31 @@
-// flowengine — scene shader, WGSL port of FS_SCENE (GLSL-ES 1.0).
+// flowengine — "Starry Night porthole": a swirling Van Gogh sky + FFT voiceprint,
+// cropped to a circular window (black outside), with a glowing gold rim.
 // ---------------------------------------------------------------------------
-// Target stack (all Rust-side code MUST match these exact versions):
-//     wgpu   = "22.1"      (Metal on macOS / Apple Silicon, Vulkan on Linux)
-//     winit  = "0.30"
-//     bytemuck, image, cpal, realfft on their current releases.
-//
-// This file is version-independent WGSL (stable since wgpu 0.14), but the
-// BIND GROUP LAYOUT it assumes is fixed and the Rust host must create exactly:
-//
-//   bind group 0:
-//     @binding(0)  var<uniform> U       -> uniform buffer, 32 bytes (see Uniforms)
-//     @binding(1)  var spec_tex         -> texture_2d<f32>, 256x1 R8Unorm,
-//                                          written each frame via queue.write_texture
-//     @binding(2)  var spec_samp        -> sampler (filtering, clamp-to-edge)
-//
-// Pipeline: no vertex buffers. Draw a single 3-vertex fullscreen triangle
-// (render_pass.draw(0..3, 0..1)); the vertex stage synthesises clip positions
-// from @builtin(vertex_index). The fragment stage reconstructs pixel position
-// from @builtin(position) (WGSL's replacement for gl_FragCoord) and does the
-// whole radial effect from there. Surface format is assumed non-sRGB-view
-// linear write of an already gamma-corrected colour (pow(col,0.85) below), i.e.
-// the pipeline's fragment target should be the Bgra8Unorm (NOT _srgb) view so
-// the tonemap/gamma matches the original GLES output 1:1. If you configure an
-// _srgb target instead, drop the final pow() to avoid double gamma.
+// wgpu 25 (Metal/Vulkan/DX12) + winit 0.30. Bind group 0:
+//   @binding(0) var<uniform> U   -> 32-byte Uniforms (time,level,peak,bass,res,voice)
+//   @binding(1) var spec_tex     -> texture_2d<f32>, 256x1 R8Unorm (FFT, per frame)
+//   @binding(2) var spec_samp    -> filtering sampler, clamp-to-edge
+// Fullscreen triangle, no vertex buffers. NON-sRGB (Bgra8Unorm) target.
+// Metal-safe: squares written x*x; pow() only on non-negative bases.
 // ---------------------------------------------------------------------------
 
 const TAU: f32 = 6.28318530718;
+const RAD: f32 = 0.40;   // porthole radius (uv units; full circle with margin)
 
-// -- Uniforms -----------------------------------------------------------------
-// Matches this #[repr(C)] Rust struct (bytemuck Pod/Zeroable), 32 bytes total:
-//
-//   #[repr(C)]
-//   #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-//   struct Uniforms {
-//       time:  f32,        // offset  0   u_time
-//       level: f32,        // offset  4   u_level (RMS, 0..1)
-//       peak:  f32,        // offset  8   u_peak
-//       bass:  f32,        // offset 12   u_bass
-//       res:   [f32; 2],   // offset 16   u_res (framebuffer px, w,h)
-//       _pad:  [f32; 2],   // offset 24   padding -> 32 bytes (16-byte aligned)
-//   }
-//
-// WGSL: vec2<f32> has align 8; placing `res` at offset 16 satisfies it, and the
-// trailing _pad rounds the struct up to a 16-byte multiple as UBOs require.
 struct Uniforms {
-    time:  f32,
-    level: f32,
-    peak:  f32,
-    bass:  f32,
-    res:   vec2<f32>,
-    _pad:  vec2<f32>,
+    time:  f32,        // 0
+    level: f32,        // 4
+    peak:  f32,        // 8
+    bass:  f32,        // 12
+    res:   vec2<f32>,  // 16
+    voice: f32,        // 24
+    flip:  f32,        // 28  0 = bars inward, 1 = bars outward
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
 @group(0) @binding(1) var spec_tex: texture_2d<f32>;
 @group(0) @binding(2) var spec_samp: sampler;
 
-// -- Vertex: fullscreen triangle ---------------------------------------------
-// Three verts, no vertex buffer. The triangle (-1,-1)(3,-1)(-1,3) fully covers
-// the [-1,1] clip square; the surplus is clipped. @builtin(position) in the
-// fragment stage then carries pixel coords (origin top-left, y down in WGSL).
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
 };
@@ -67,109 +33,114 @@ struct VsOut {
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     var out: VsOut;
-    // x: -1, 3, -1   y: -1, -1, 3
-    let x = f32(i32(vid & 1u) * 4 - 1);   // vid=0->-1, vid=1->3, vid=2->-1
-    let y = f32(i32(vid >> 1u) * 4 - 1);  // vid=0->-1, vid=1->-1, vid=2->3
+    let x = f32(i32(vid & 1u) * 4 - 1);
+    let y = f32(i32(vid >> 1u) * 4 - 1);
     out.pos = vec4<f32>(x, y, 0.0, 1.0);
     return out;
 }
 
-fn hash21(p_in: vec2<f32>) -> f32 {
-    var p = fract(p_in * vec2<f32>(123.34, 345.45));
-    p = p + dot(p, p + 34.345);
-    return fract(p.x * p.y);
-}
-
-// -- Fragment: the alien-Jarvis radial scene (NO rotation) --------------------
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let res = U.res;
-
-    // GLES gl_FragCoord has origin at bottom-left (y up); WGSL @builtin(position)
-    // is top-left (y down). Flip y so the visual (and the FFT ring's angular
-    // ordering via atan2) matches the original 1:1.
-    let frag = vec2<f32>(in.pos.x, res.y - in.pos.y);
-
-    // vec2 uv=(gl_FragCoord.xy-0.5*u_res)/u_res.y;
+    let frag = vec2<f32>(in.pos.x, res.y - in.pos.y);   // flip y
     let uv: vec2<f32> = (frag - 0.5 * res) / res.y;
-    let r: f32   = length(uv);
-    let ang: f32 = atan2(uv.y, uv.x);   // WGSL two-arg atan2(y, x)
-    let t: f32   = U.time;
+    let r: f32 = length(uv);
+    let t: f32 = U.time;
 
     let lv: f32    = clamp(U.level, 0.0, 1.0);
+    let voice: f32 = U.voice;
     let drive: f32 = max(lv, U.bass);
     let dc: f32    = drive / (0.6 + drive);
 
-    let cyan  = vec3<f32>(0.26, 0.76, 1.0);
-    let pale  = vec3<f32>(0.80, 0.94, 1.0);
-    let amber = vec3<f32>(1.0,  0.70, 0.28);
-    let alien = vec3<f32>(0.30, 1.0,  0.75);
-    var col   = vec3<f32>(0.0);
+    // Van Gogh "Starry Night" palette
+    let deep  = vec3<f32>(0.02, 0.05, 0.15);
+    let ultra = vec3<f32>(0.08, 0.28, 0.68);
+    let cyan  = vec3<f32>(0.32, 0.72, 1.0);
+    let gold  = vec3<f32>(1.0,  0.82, 0.26);
 
-    // dark near-black-blue base, fading out with radius
-    col += vec3<f32>(0.015, 0.035, 0.075) * (1.0 - smoothstep(0.0, 1.3, r));
-
-    // concentric energy waves radiating OUTWARD  (sin(r*26 - t*3.5), squared)
-    let ws: f32 = max(sin(r * 26.0 - t * 3.5), 0.0);
-    col += mix(cyan, alien, 0.25) * ws * ws
-         * smoothstep(0.08, 0.35, r) * smoothstep(1.2, 0.5, r)
-         * (0.10 + 0.5 * lv);
-
-    // two sonar pulses expanding to the edges, fading as they go
-    for (var i: i32 = 0; i < 2; i = i + 1) {
-        let ph: f32  = fract(t * 0.20 + f32(i) * 0.5);
-        let pr: f32  = ph * 1.45;
-        let son: f32 = exp(-pow((r - pr) * 11.0, 2.0)) * (1.0 - ph);
-        col += cyan * son * (0.20 + 0.5 * dc);
+    // --- swirling flow field: domain-warp uv into eddies (flows, never strobes) ---
+    var p = uv;
+    let turb: f32 = 0.26 + 0.50 * voice + 0.12 * lv;
+    for (var k: i32 = 0; k < 3; k = k + 1) {
+        let fk: f32 = 2.2 + f32(k) * 2.3;
+        p += turb * 0.14 * vec2<f32>(
+            sin(fk * p.y + t * 0.55 + f32(k) * 1.7),
+            cos(fk * p.x - t * 0.48 + f32(k) * 1.1)
+        );
     }
+    let rw:  f32 = length(p);
+    let sang: f32 = atan2(p.y, p.x);
 
-    // compressed cyan core (never blows to flat white) + hot point + corona ring
-    let breath: f32 = 0.5 + 0.5 * sin(t * 0.7);
-    let coreK: f32  = 30.0 - 11.0 * dc;
-    let core: f32   = exp(-r * r * coreK);
-    let coreI: f32  = 0.26 + 0.10 * breath + 0.85 * dc;
-    col += mix(cyan, pale, clamp(0.25 + 0.45 * dc, 0.0, 0.85)) * core * coreI;
-    col += pale * exp(-r * r * 460.0) * (0.30 + 0.6 * dc);        // small hot point
-    let ringR: f32 = 0.145 + 0.02 * breath;
-    col += cyan * exp(-pow((r - ringR) * 28.0, 2.0)) * (0.10 + 0.9 * lv); // corona
+    // --- painterly brushstrokes following the swirl ---
+    let stroke: f32 = 0.5 + 0.5 * sin(rw * 30.0 - t * 1.1 + 5.0 * sin(sang * 2.0 + t * 0.2));
+    let paint:  f32 = 0.5 + 0.5 * sin(p.x * 20.0 + 9.0 * p.y + t * 0.15);
+    let tex:    f32 = mix(stroke, paint, 0.4);
 
-    // log-frequency FFT ring, sampled from the 256x1 spectrum texture by angle
-    let aa: f32  = fract(ang / TAU + 0.75);
-    let bin: f32 = pow(aa, 2.0);
-    var mag: f32 = textureSample(spec_tex, spec_samp,
-                                 vec2<f32>(clamp(bin, 0.003, 0.997), 0.5)).r;
+    // --- night-sky body: deep -> ultramarine, cyan crests, gold flecks ---
+    var col = deep;
+    let body: f32 = tex * 0.9 + 0.14;
+    col = mix(col, ultra, clamp(body, 0.0, 1.0));
+    let crest: f32 = tex * tex * tex * tex;
+    col += cyan * crest * (0.35 + 0.6 * lv);
+    col += gold * smoothstep(0.78, 0.98, tex) * (0.22 + 0.7 * voice);
+
+    // --- central golden STAR + slow radiant rays ---
+    let breath: f32 = 0.5 + 0.5 * sin(t * 0.6);
+    let core: f32   = exp(-r * r * (26.0 - 10.0 * dc));
+    col += mix(cyan, gold, 0.35 + 0.5 * dc) * core * (0.30 + 0.9 * dc);
+    col += gold * exp(-r * r * 90.0) * (0.40 + 0.8 * dc);
+    let rays: f32 = 0.5 + 0.5 * sin(sang * 6.0 + t * 0.3);
+    col += gold * rays * exp(-r * r * 12.0) * (0.06 + 0.10 * breath + 0.20 * voice);
+
+    // --- FFT voiceprint ring: golden star-bursts (unwarped angle -> stable bins) ---
+    let a0: f32  = atan2(uv.y, uv.x);
+    let aa: f32  = fract(a0 / TAU + 0.75);
+    let bin: f32 = aa * aa;
+    var mag: f32 = textureSample(spec_tex, spec_samp, vec2<f32>(clamp(bin, 0.003, 0.997), 0.5)).r;
     mag = mag * mag;
-    let baseR: f32   = 0.26;
-    let barMax: f32  = 0.18;
-    let bars: f32    = 108.0;
-    let slot: f32    = fract((ang / TAU) * bars);
+    let slot: f32    = fract((a0 / TAU) * 96.0);
     let barMask: f32 = smoothstep(0.60, 0.28, abs(slot - 0.5) * 2.0);
-    let outer: f32   = baseR + mag * barMax;
-    let inbar: f32   = step(baseR, r) * step(r, outer) * barMask;
-    col += cyan * inbar * (0.30 + 0.7 * mag);
-    col += pale * exp(-pow((r - outer) * 46.0, 2.0)) * barMask * mag * 0.7;
-    col += cyan * exp(-pow((r - baseR) * 120.0, 2.0)) * 0.18;
+    // bars hang from the golden rim; Space toggles inward (flip 0) / outward (flip 1)
+    let barLen: f32  = 0.20;
+    let inner: f32   = RAD - mag * barLen;
+    let outb:  f32   = RAD + mag * barLen;
+    let inA:   f32   = step(inner, r) * step(r, RAD);
+    let outA:  f32   = step(RAD, r) * step(r, outb);
+    let inbar: f32   = mix(inA, outA, U.flip) * barMask;
+    let tipR:  f32   = mix(inner, outb, U.flip);
+    let barGate: f32 = 0.18 + 1.05 * voice;
+    var fbar = vec3<f32>(0.0);
+    fbar += mix(gold, cyan, mag) * inbar * (0.40 + 0.8 * mag) * barGate;
+    let dtip: f32 = (r - tipR) * 42.0;
+    fbar += gold * exp(-dtip * dtip) * barMask * mag * barGate;
 
-    // static concentric rings + FFT-DRIVEN radial pulse emission (energy=spectrum)
-    let o1: f32 = exp(-pow((r - 0.60) * 70.0, 2.0));
-    col += cyan * o1 * (0.10 + 0.06 * sin(t * 1.5)) * (0.6 + 0.6 * lv);
-    let o2: f32 = exp(-pow((r - 0.80) * 60.0, 2.0));
-    col += mix(cyan, alien, 0.5) * o2 * (0.08 + 0.05 * sin(t * 1.1 + 1.0));
-    let phM: f32    = fract(r * 1.8 - t * 1.3);
-    let pulseM: f32 = smoothstep(0.0, 0.12, phM) * smoothstep(0.55, 0.12, phM);
-    let sp: f32     = 0.5 + 0.5 * sin(ang * 80.0);   // sin(ang*80) shaped, cubed below
-    col += mix(cyan, pale, 0.3) * pulseM * (sp * sp * sp) * mag
-         * smoothstep(0.16, 0.4, r) * smoothstep(1.15, 0.5, r) * 2.4;
+    // --- peak-hold bloom (white-gold flush on a strong peak) ---
+    let hold: f32 = U.peak * U.peak;
+    col += mix(vec3<f32>(1.0, 1.0, 1.0), gold, 0.5) * exp(-r * r * 5.0) * hold * 0.6;
 
-    // amber flare on peaks
-    col += amber * core  * smoothstep(0.6,  1.0, U.peak) * 1.1;
-    col += amber * inbar * smoothstep(0.75, 1.0, U.peak) * 0.5;
+    // soft inner vignette + tonemap + gamma on the sky
+    col *= 0.55 + 0.45 * smoothstep(RAD, 0.05, r);
+    col = col / (1.0 + col);
+    col = pow(col, vec3<f32>(0.85));
 
-    // alien-teal edge shift + vignette + Reinhard tonemap + gamma
-    col = mix(col, col * vec3<f32>(0.7, 1.15, 1.0), smoothstep(0.55, 1.15, r) * 0.5);
-    col *= 0.4 + 0.6 * smoothstep(1.3, 0.12, r);        // vignette
-    col = col / (1.0 + col);                            // Reinhard
-    col = pow(col, vec3<f32>(0.85));                    // gamma
+    // TWO ZONES: inside vivid; outside dimmed to a faint filtered backdrop (not black)
+    let disc: f32 = 1.0 - smoothstep(RAD - 0.02, RAD + 0.08, r);
+    col *= mix(0.15, 1.0, disc);
 
+    // FFT bars + gold rim ON TOP (full brightness, so OUTWARD bars aren't dimmed away)
+    col += fbar / (1.0 + fbar);
+
+    // LIVING gold rim: it breathes, a shimmer of light courses around it, and a bright
+    // glint slowly travels the ring — plus it swells when you speak.
+    let breathR: f32 = RAD + 0.006 * sin(t * 1.3);              // gentle radius breathing
+    let drim: f32    = (r - breathR) * 55.0;
+    let ring: f32    = exp(-drim * drim);
+    let flow: f32    = 0.70 + 0.30 * sin(a0 * 5.0 - t * 1.6) * (0.6 + 0.4 * sin(a0 * 2.0 + t * 0.7));
+    let rimI: f32    = 0.40 + 0.10 * sin(t * 1.3) + 0.55 * voice;
+    col += gold * ring * flow * rimI;
+    let glint: f32   = pow(max(0.5 + 0.5 * sin(a0 - t * 0.9), 0.0), 8.0);   // travelling glint
+    col += vec3<f32>(1.0, 0.94, 0.65) * ring * glint * (0.5 + 0.6 * voice);
+
+    col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(col, 1.0);
 }

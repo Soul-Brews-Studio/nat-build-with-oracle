@@ -33,102 +33,105 @@ const VS: &str = r#"attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0)
 // Pass 1 — the alien Jarvis visual (rendered at 720p). No HUD here.
 const FS_SCENE: &str = r#"
 precision highp float;
-uniform float u_time, u_level, u_peak, u_bass;
+uniform float u_time, u_level, u_peak, u_bass, u_voice, u_flip;
 uniform vec2  u_res;
 uniform sampler2D u_spec;
 #define TAU 6.28318530718
-float hash21(vec2 p){ p=fract(p*vec2(123.34,345.45)); p+=dot(p,p+34.345); return fract(p.x*p.y); }
+#define RAD 0.40
+// "Starry Night porthole": swirling Van Gogh sky + FFT voiceprint, cropped to a living
+// golden circle. u_flip: 0 = FFT bars inward, 1 = outward.
 void main(){
   vec2 uv=(gl_FragCoord.xy-0.5*u_res)/u_res.y;
   float r=length(uv);
-  float ang=atan(uv.y,uv.x);
   float t=u_time;
   float lv=clamp(u_level,0.0,1.0);
+  float voice=u_voice;
   float drive=max(lv,u_bass);
   float dc=drive/(0.6+drive);
 
-  vec3 cyan=vec3(0.26,0.76,1.0);
-  vec3 pale=vec3(0.80,0.94,1.0);
-  vec3 amber=vec3(1.0,0.70,0.28);
-  vec3 alien=vec3(0.30,1.0,0.75);
-  vec3 col=vec3(0.0);
+  vec3 deep=vec3(0.02,0.05,0.15);
+  vec3 ultra=vec3(0.08,0.28,0.68);
+  vec3 cyan=vec3(0.32,0.72,1.0);
+  vec3 gold=vec3(1.0,0.82,0.26);
 
-  col += vec3(0.015,0.035,0.075)*(1.0-smoothstep(0.0,1.3,r));
-
-  // concentric energy waves radiating OUTWARD — pure radial (the angular wobble made a
-  // dizzy SPINNING star; removed. clean concentric ripple, no rotation.)
-  float rw = r;
-  float ws=max(sin(rw*26.0 - t*3.5),0.0);
-  col += mix(cyan,alien,0.25)*ws*ws*smoothstep(0.08,0.35,r)*smoothstep(1.2,0.5,r)*(0.14+0.6*lv);
-
-  // sonar pulses expanding to the edges
-  for(int i=0;i<2;i++){
-    float ph=fract(t*0.20+float(i)*0.5);
-    float pr=ph*1.45;
-    float son=exp(-pow((r-pr)*11.0,2.0))*(1.0-ph);
-    col += cyan*son*(0.20+0.5*dc);
+  // swirling flow field: domain-warp uv into eddies (flows, never strobes)
+  vec2 p=uv;
+  float turb=0.26+0.50*voice+0.12*lv;
+  for(int k=0;k<3;k++){
+    float fk=2.2+float(k)*2.3;
+    p+=turb*0.14*vec2(sin(fk*p.y+t*0.55+float(k)*1.7), cos(fk*p.x-t*0.48+float(k)*1.1));
   }
+  float rw=length(p);
+  float sang=atan(p.y,p.x);
 
-  // core (compressed brightness, stays cyan)
-  float breath=0.5+0.5*sin(t*0.7);
-  float coreK=30.0-11.0*dc;
-  float core=exp(-r*r*coreK);
-  float coreI=0.26+0.10*breath+0.85*dc;
-  col += mix(cyan,pale,clamp(0.25+0.45*dc,0.0,0.85))*core*coreI;
-  col += pale*exp(-r*r*460.0)*(0.30+0.6*dc);
-  float R=0.145+0.02*breath;
-  col += cyan*exp(-pow((r-R)*28.0,2.0))*(0.10+0.9*lv);
+  // painterly brushstrokes following the swirl
+  float stroke=0.5+0.5*sin(rw*30.0 - t*1.1 + 5.0*sin(sang*2.0+t*0.2));
+  float paint=0.5+0.5*sin(p.x*20.0 + 9.0*p.y + t*0.15);
+  float tex=mix(stroke,paint,0.4);
 
-  // FFT spectrum ring — GATED. The spiky bars were what looked like rapid "vibrating"
-  // (they flicker with every FFT frame). Now they fade in ONLY on peaks; at rest the
-  // ring is just a calm faint circle — no more dizzy shaking.
-  float aa=fract(ang/TAU+0.75);
-  float bin=pow(aa,2.0);
+  vec3 col=deep;
+  float body=tex*0.9+0.14;
+  col=mix(col,ultra,clamp(body,0.0,1.0));
+  float crest=tex*tex*tex*tex;
+  col += cyan*crest*(0.35+0.6*lv);
+  col += gold*smoothstep(0.78,0.98,tex)*(0.22+0.7*voice);
+
+  // central golden star + slow radiant rays
+  float breath=0.5+0.5*sin(t*0.6);
+  float core=exp(-r*r*(26.0-10.0*dc));
+  col += mix(cyan,gold,0.35+0.5*dc)*core*(0.30+0.9*dc);
+  col += gold*exp(-r*r*90.0)*(0.40+0.8*dc);
+  float rays=0.5+0.5*sin(sang*6.0+t*0.3);
+  col += gold*rays*exp(-r*r*12.0)*(0.06+0.10*breath+0.20*voice);
+
+  // FFT voiceprint bars hanging from the golden rim; u_flip toggles inward/outward
+  float a0=atan(uv.y,uv.x);
+  float aa=fract(a0/TAU+0.75);
+  float bin=aa*aa;
   float mag=texture2D(u_spec, vec2(clamp(bin,0.003,0.997),0.5)).r;
   mag=mag*mag;
-  float baseR=0.26, barMax=0.18, bars=108.0;
-  float slot=fract((ang/TAU)*bars);
+  float slot=fract((a0/TAU)*96.0);
   float barMask=smoothstep(0.60,0.28, abs(slot-0.5)*2.0);
-  float outer=baseR+mag*barMax;
-  float inbar=step(baseR,r)*step(r,outer)*barMask;
-  float barGate=smoothstep(0.35,0.85,u_peak)*0.5;   // spikes stay subtle even at peak
-  col += cyan*inbar*(0.30+0.7*mag)*barGate;
-  col += pale*exp(-pow((r-outer)*46.0,2.0))*barMask*mag*0.5*barGate;
-  col += cyan*exp(-pow((r-baseR)*120.0,2.0))*0.14;   // faint base ring always (calm anchor)
+  float barLen=0.20;
+  float inner=RAD-mag*barLen;
+  float outb=RAD+mag*barLen;
+  float inA=step(inner,r)*step(r,RAD);
+  float outA=step(RAD,r)*step(r,outb);
+  float inbar=mix(inA,outA,u_flip)*barMask;
+  float tipR=mix(inner,outb,u_flip);
+  float barGate=0.18+1.05*voice;
+  vec3 fbar=vec3(0.0);
+  fbar += mix(gold,cyan,mag)*inbar*(0.40+0.8*mag)*barGate;
+  float dtip=(r-tipR)*42.0;
+  fbar += gold*exp(-dtip*dtip)*barMask*mag*barGate;
 
-  // static concentric rings
-  float o1=exp(-pow((r-0.60)*70.0,2.0));
-  col += cyan*o1*(0.10+0.06*sin(t*1.5))*(0.6+0.6*lv);
-  float o2=exp(-pow((r-0.80)*60.0,2.0));
-  col += mix(cyan,alien,0.5)*o2*(0.08+0.05*sin(t*1.1+1.0));
+  // peak-hold bloom (white-gold flush)
+  float hold=u_peak*u_peak;
+  col += mix(vec3(1.0),gold,0.5)*exp(-r*r*5.0)*hold*0.6;
 
-  // RING-DOWN RESONANCE RIPPLE (replaces the sharp radial spikes): impulses ring out via
-  // retarded time (t - r/c), fading in layers, + an echo rippling back inward. Membrane-like.
-  float cc=0.5;
-  float wob=13.0+9.0*u_bass;                   // slower/gentler oscillation (less "vibrating")
-  float pp=t - rw/cc;
-  float cyc=fract(pp/0.30);
-  float decay=exp(-cyc*4.0);
-  float rd=sin(wob*pp)*decay + 0.25*sin(wob*(t + rw/cc));
-  float envd=exp(-1.7*r)*smoothstep(1.2,0.35,r);
-  // gentle constant ripple — the peak adds only a MILD swell (a strong peak-driven
-  // surge read as dizzy shaking). The peak's real job is the white HOLD below.
-  float rippleAmp = 0.16 + 0.18*u_peak;
-  col += mix(cyan,alien,0.35)*max(rd,0.0)*envd*rippleAmp;
-
-  // PEAK HOLD — the core latches WHITE on a peak and fades out with the slow-release
-  // peak envelope (u_peak now holds ~1.4s). No throb, no sharp flare, no spike:
-  // just "hold white, then fade".
-  float hold = u_peak*u_peak;
-  col += vec3(0.90,0.95,1.0)*exp(-r*r*4.0)*hold*0.75;    // wide soft white hold
-  col += vec3(1.0)*exp(-r*r*20.0)*hold*0.55;             // bright white heart
-  col += amber*core*smoothstep(0.65,1.0,u_peak)*0.22;    // faint warm tint only
-
-  // alien teal edge + vignette + tonemap
-  col = mix(col, col*vec3(0.7,1.15,1.0), smoothstep(0.55,1.15,r)*0.5);
-  col *= 0.4+0.6*smoothstep(1.3,0.12,r);
+  // vignette + tonemap + gamma on the sky
+  col *= 0.55+0.45*smoothstep(RAD,0.05,r);
   col = col/(1.0+col);
   col = pow(col, vec3(0.85));
+
+  // TWO ZONES: inside vivid; outside dimmed to a faint filtered backdrop (not black)
+  float disc=1.0-smoothstep(RAD-0.02,RAD+0.08,r);
+  col *= mix(0.15,1.0,disc);
+
+  // FFT bars on top (full brightness in or out)
+  col += fbar/(1.0+fbar);
+
+  // LIVING gold rim: breathes, a shimmer courses around, a glint travels the ring
+  float breathR=RAD+0.006*sin(t*1.3);
+  float drim=(r-breathR)*55.0;
+  float ring=exp(-drim*drim);
+  float flow=0.70+0.30*sin(a0*5.0-t*1.6)*(0.6+0.4*sin(a0*2.0+t*0.7));
+  float rimI=0.40+0.10*sin(t*1.3)+0.55*voice;
+  col += gold*ring*flow*rimI;
+  float glint=pow(max(0.5+0.5*sin(a0-t*0.9),0.0),8.0);
+  col += vec3(1.0,0.94,0.65)*ring*glint*(0.5+0.6*voice);
+
+  col = clamp(col,0.0,1.0);
   gl_FragColor=vec4(col,1.0);
 }
 "#;
@@ -305,15 +308,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     // scene-program uniforms
-    let (u_time, u_res_s, u_level, u_peak, u_bass) = unsafe {
+    let (u_time, u_res_s, u_level, u_peak, u_bass, u_voice, u_flip) = unsafe {
         gl.use_program(Some(scene_prog));
         gl.uniform_1_i32(gl.get_uniform_location(scene_prog, "u_spec").as_ref(), 0);
         (gl.get_uniform_location(scene_prog, "u_time"),
          gl.get_uniform_location(scene_prog, "u_res"),
          gl.get_uniform_location(scene_prog, "u_level"),
          gl.get_uniform_location(scene_prog, "u_peak"),
-         gl.get_uniform_location(scene_prog, "u_bass"))
+         gl.get_uniform_location(scene_prog, "u_bass"),
+         gl.get_uniform_location(scene_prog, "u_voice"),
+         gl.get_uniform_location(scene_prog, "u_flip"))
     };
+    // FFT bars inward by default (0.0); set FLOWENGINE_FLIP=1 for outward.
+    let flip_val: f32 = if std::env::var("FLOWENGINE_FLIP").ok().as_deref() == Some("1") { 1.0 } else { 0.0 };
     // comp-program uniforms
     let u_res_c = unsafe {
         gl.use_program(Some(comp_prog));
@@ -414,6 +421,8 @@ fn main() -> anyhow::Result<()> {
             gl.uniform_1_f32(u_level.as_ref(), level);
             gl.uniform_1_f32(u_peak.as_ref(), peak);
             gl.uniform_1_f32(u_bass.as_ref(), bass);
+            gl.uniform_1_f32(u_voice.as_ref(), analyzer.voice_env);
+            gl.uniform_1_f32(u_flip.as_ref(), flip_val);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
             // pass 2: upscale + HUD -> default framebuffer (1080p)

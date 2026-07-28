@@ -32,7 +32,8 @@ struct Uniforms {
     peak: f32,     // off 8
     bass: f32,     // off 12
     res: [f32; 2], // off 16  (vec2 align 8; 16 is a multiple of 8)
-    _pad: [f32; 2], // off 24 -> total 32 (UBO 16-byte multiple)
+    voice: f32,    // off 24  VAD envelope 0..1
+    flip: f32,     // off 28  0 = bars inward, 1 = bars outward
 }
 // Guard the ABI: WGSL derives struct size 24; Rust hands a 32-byte buffer (a legal
 // superset), with `res` landing exactly on offset 16 on both sides.
@@ -66,6 +67,8 @@ struct Gfx {
     can_snapshot: bool,
     readback: wgpu::Buffer,
     padded_bpr: u32,
+
+    flip: bool, // Space toggles the FFT bars inward / outward
 }
 
 impl Gfx {
@@ -291,6 +294,7 @@ impl Gfx {
             can_snapshot,
             readback,
             padded_bpr,
+            flip: false,
         })
     }
 
@@ -333,6 +337,21 @@ impl Gfx {
         self.update_audio();
         let (level, peak, bass) = self.analyzer.process(&self.win_buf, dt);
 
+        // live readout in the title bar + a periodic stderr line, so it's obvious
+        // whether the mic is actually feeding samples (all-zero LVL => TCC-blocked).
+        // (self.frame is advanced at the end of render(), so read it as-is here.)
+        if self.frame % 20 == 0 {
+            let sig = if self.analyzer.speaking { "VOICE" } else if level > 0.04 { "noise" } else { "quiet" };
+            self.window.set_title(&format!(
+                "flowengine — LVL {:.2}  PEAK {:.2}  {:>4.0}Hz  VOICE {:>3.0}%  [{}]",
+                level, peak, self.analyzer.peak_hz, self.analyzer.voice_ratio * 100.0, sig
+            ));
+            if self.frame % 120 == 0 {
+                eprintln!("audio: lvl={level:.3} peak={peak:.3} hz={:.0} voice_ratio={:.2} speaking={}",
+                    self.analyzer.peak_hz, self.analyzer.voice_ratio, self.analyzer.speaking);
+            }
+        }
+
         // upload uniforms
         let u = Uniforms {
             time: (now - self.start).as_secs_f32(),
@@ -340,7 +359,8 @@ impl Gfx {
             peak,
             bass,
             res: [self.config.width as f32, self.config.height as f32],
-            _pad: [0.0; 2],
+            voice: self.analyzer.voice_env,
+            flip: if self.flip { 1.0 } else { 0.0 },
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
@@ -494,6 +514,13 @@ impl ApplicationHandler for App {
                 if event.logical_key == Key::Named(NamedKey::Escape) =>
             {
                 event_loop.exit()
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == winit::event::ElementState::Pressed
+                    && event.logical_key == Key::Named(NamedKey::Space) =>
+            {
+                gfx.flip = !gfx.flip;
+                eprintln!("bars: {}", if gfx.flip { "OUTWARD" } else { "INWARD" });
             }
             WindowEvent::Resized(new) => gfx.resize(new),
             WindowEvent::RedrawRequested => match gfx.render() {

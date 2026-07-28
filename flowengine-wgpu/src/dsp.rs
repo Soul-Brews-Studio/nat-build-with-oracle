@@ -9,6 +9,13 @@ const N: usize = 1024;
 const SPEC_BINS: usize = 256;
 const MIN_DB: f32 = -92.0;
 const MAX_DB: f32 = -24.0;
+const HP_CUTOFF_HZ: f32 = 90.0; // high-pass: kill mic rumble / mains hum below this
+
+/// GLSL-style smoothstep — 0 below e0, 1 above e1, smooth ramp between.
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 
 pub struct AudioAnalyzer {
     fft: Arc<dyn RealToComplex<f32>>,
@@ -22,6 +29,11 @@ pub struct AudioAnalyzer {
     level_v: f32,
     peak: f32,
     pub peak_hz: f32,
+    pub speaking: bool,
+    pub voice: bool,       // this frame looks like human speech (not noise / random sound)
+    pub voice_ratio: f32,  // fraction of energy inside the speech band (diagnostic)
+    pub voice_env: f32,    // smooth 0..1 envelope of the speaking state — drives the visual
+    speak_hold: f32,       // seconds STATUS stays "SPEAKING" after the last voiced frame
     sample_rate: f32,
 }
 
@@ -50,6 +62,11 @@ impl AudioAnalyzer {
             level_v: 0.0,
             peak: 0.0,
             peak_hz: 0.0,
+            speaking: false,
+            voice: false,
+            voice_ratio: 0.0,
+            voice_env: 0.0,
+            speak_hold: 0.0,
             sample_rate: sample_rate as f32,
         }
     }
@@ -66,11 +83,13 @@ impl AudioAnalyzer {
         cds_tween(&mut self.level_x, &mut self.level_v, target, 12.0, dt);
         let level = self.level_x.max(0.0);
 
-        // fast-attack / slow-decay peak
+        // fast-attack / SLOW-decay peak-HOLD envelope. Attack is instant (latch on a
+        // transient); release is gentle (~1.4s time-constant) so a peak HOLDS then
+        // fades out smoothly instead of snapping back — no jittery re-triggering.
         if target > self.peak {
             self.peak = target;
         } else {
-            self.peak += (target - self.peak) * (1.0 - (-6.0 * dt).exp());
+            self.peak += (target - self.peak) * (1.0 - (-1.4 * dt).exp());
         }
 
         // windowed FFT
@@ -81,19 +100,70 @@ impl AudioAnalyzer {
             .fft
             .process_with_scratch(&mut self.inbuf, &mut self.outbuf, &mut self.scratch);
 
-        // per-bin magnitude with linear temporal smoothing (Web-Audio: smooth then dB)
+        // per-bin magnitude with linear temporal smoothing (Web-Audio: smooth then dB).
+        // HIGH-PASS: roll off bins below ~90 Hz — the mic's DC/rumble/mains-hum energy
+        // sits in bin 0-1 (~43 Hz) and otherwise dominates peak-Hz and bass. A high-pass
+        // (not low-pass) is what removes LOW-frequency noise.
+        let cutoff_bin = (HP_CUTOFF_HZ * N as f32 / self.sample_rate).max(1.0);
         let tau = 0.62f32;
         let mut max_mag = 0.0f32;
         let mut max_i = 0usize;
+        let mut sum_mag = 0.0f32;
         for (i, c) in self.outbuf.iter().enumerate() {
-            let m = c.norm() / N as f32;
+            let hp = smoothstep(0.4 * cutoff_bin, cutoff_bin, i as f32); // 0 at DC → 1 above cutoff
+            let m = (c.norm() / N as f32) * hp;
             self.smooth[i] = tau * self.smooth[i] + (1.0 - tau) * m;
+            sum_mag += self.smooth[i];
             if self.smooth[i] > max_mag {
                 max_mag = self.smooth[i];
                 max_i = i;
             }
         }
-        self.peak_hz = max_i as f32 * self.sample_rate / N as f32;
+        // peak-frequency with a TIME MOVING AVERAGE. Only trust a peak that clearly
+        // stands out from the noise floor (dominance test), then EMA-smooth it so the
+        // readout doesn't jitter or chase noise frame-to-frame. Silence → ease to 0.
+        let mean_mag = sum_mag / self.smooth.len() as f32;
+        let dominant = max_mag > 6.0 * mean_mag && max_mag > 1e-5;
+        if level > 0.03 && dominant {
+            let raw_hz = max_i as f32 * self.sample_rate / N as f32;
+            if self.peak_hz <= 0.0 {
+                self.peak_hz = raw_hz; // seed instantly on first detection
+            } else {
+                self.peak_hz = 0.82 * self.peak_hz + 0.18 * raw_hz; // moving average
+            }
+        } else if level <= 0.02 {
+            self.peak_hz *= 0.90; // ease toward 0 when quiet
+            if self.peak_hz < 1.0 {
+                self.peak_hz = 0.0;
+            }
+        }
+
+        // VOICE-ACTIVITY DETECTION — human speech, or just noise / a random sound?
+        // Human speech concentrates its energy in ~120 Hz–3.8 kHz with a fundamental
+        // (pitch) in the vocal range; broadband hiss and out-of-band thuds do not.
+        let bin_hz = self.sample_rate / N as f32;
+        let bidx = |hz: f32| ((hz / bin_hz) as usize).min(self.smooth.len() - 1);
+        let (lo, hi) = (bidx(120.0), bidx(3800.0));
+        let voice_e: f32 = self.smooth[lo..=hi].iter().map(|m| m * m).sum();
+        let total_e: f32 = self.smooth.iter().map(|m| m * m).sum::<f32>() + 1e-12;
+        self.voice_ratio = voice_e / total_e;
+        let pitch_ok = self.peak_hz >= 90.0 && self.peak_hz <= 1000.0; // fundamental in vocal range
+        self.voice = level > 0.05 && self.voice_ratio > 0.55 && pitch_ok;
+
+        // STATUS "SPEAKING": hold + hysteresis on the VOICE decision, so a pause between
+        // words doesn't cut it and a stray noise blip doesn't trigger it.
+        if self.voice {
+            self.speak_hold = 0.6;
+        } else {
+            self.speak_hold = (self.speak_hold - dt).max(0.0);
+        }
+        self.speaking = self.speak_hold > 0.0;
+
+        // smooth 0..1 envelope of the speaking state: rises fast when a voice is present,
+        // eases down after — this is what the shader uses to swell the ripple on speech
+        // while staying calm at rest.
+        let vt = if self.speaking { 1.0 } else { 0.0 };
+        self.voice_env += (vt - self.voice_env) * (1.0 - (-5.0 * dt).exp());
 
         // dB byte map for the first SPEC_BINS bins
         for i in 0..SPEC_BINS {

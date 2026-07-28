@@ -32,6 +32,7 @@ pub struct AudioAnalyzer {
     pub speaking: bool,
     pub voice: bool,       // this frame looks like human speech (not noise / random sound)
     pub voice_ratio: f32,  // fraction of energy inside the speech band (diagnostic)
+    pub voice_env: f32,    // smooth 0..1 envelope of the speaking state — drives the visual
     speak_hold: f32,       // seconds STATUS stays "SPEAKING" after the last voiced frame
     sample_rate: f32,
 }
@@ -64,6 +65,7 @@ impl AudioAnalyzer {
             speaking: false,
             voice: false,
             voice_ratio: 0.0,
+            voice_env: 0.0,
             speak_hold: 0.0,
             sample_rate: sample_rate as f32,
         }
@@ -156,6 +158,12 @@ impl AudioAnalyzer {
             self.speak_hold = (self.speak_hold - dt).max(0.0);
         }
         self.speaking = self.speak_hold > 0.0;
+
+        // smooth 0..1 envelope of the speaking state: rises fast when a voice is present,
+        // eases down after — this is what the shader uses to swell the ripple on speech
+        // while staying calm at rest.
+        let vt = if self.speaking { 1.0 } else { 0.0 };
+        self.voice_env += (vt - self.voice_env) * (1.0 - (-5.0 * dt).exp());
 
         // dB byte map for the first SPEC_BINS bins
         for i in 0..SPEC_BINS {
