@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<labwc_config>
+  <windowRules>
+    <windowRule identifier="term-left" serverDecoration="no" skipTaskbar="yes">
+      <action name="MoveToOutput" output="HDMI-A-1"/>
+      <action name="ToggleFullscreen"/>
+    </windowRule>
+    <windowRule identifier="term-right" serverDecoration="no" skipTaskbar="yes">
+      <action name="MoveToOutput" output="HDMI-A-2"/>
+      <action name="ToggleFullscreen"/>
+    </windowRule>
+  </windowRules>
+</labwc_config>
