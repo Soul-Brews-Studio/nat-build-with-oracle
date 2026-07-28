@@ -28,6 +28,27 @@ impl AsFd for Card {
 impl BasicDevice for Card {}
 impl ControlDevice for Card {}
 
+// --- VT-switch awareness: coexist with the desktop; `chvt` hands the screens over. ---
+// The kernel signals us when the user switches VT away (release) / back (acquire); we
+// drop / re-grab DRM master and re-modeset, so no stop/start is needed to share HDMI.
+use std::sync::atomic::{AtomicBool, Ordering};
+static VT_RELEASE: AtomicBool = AtomicBool::new(false);
+static VT_ACQUIRE: AtomicBool = AtomicBool::new(false);
+extern "C" fn vt_relsig(_: libc::c_int) { VT_RELEASE.store(true, Ordering::SeqCst); }
+extern "C" fn vt_acqsig(_: libc::c_int) { VT_ACQUIRE.store(true, Ordering::SeqCst); }
+const VT_SETMODE: libc::c_ulong = 0x5602; // linux/vt.h
+const VT_RELDISP: libc::c_ulong = 0x5605;
+const VT_PROCESS: libc::c_char = 1;
+const VT_ACKACQ: libc::c_int = 2;
+#[repr(C)]
+struct VtMode {
+    mode: libc::c_char,
+    waitv: libc::c_char,
+    relsig: libc::c_short,
+    acqsig: libc::c_short,
+    frsig: libc::c_short,
+}
+
 const VS: &str = r#"attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }"#;
 
 // Pass 1 — the alien Jarvis visual (rendered at 720p). No HUD here.
@@ -366,6 +387,32 @@ fn main() -> anyhow::Result<()> {
     let mut prev_bo: Option<gbm::BufferObject<()>> = None;
     let mut prev_fb: Option<framebuffer::Handle> = None;
     let mut first = true;
+
+    // Register for VT release/acquire signals on the active console (tty0). After this,
+    // `chvt` away → the kernel sends SIGUSR1 (we drop DRM master); `chvt` back → SIGUSR2
+    // (we re-grab master + re-modeset). Lets flowengine share HDMI with the desktop.
+    let vt_file = OpenOptions::new().read(true).write(true).open("/dev/tty0").ok();
+    let vt_fd = {
+        use std::os::unix::io::AsRawFd;
+        vt_file.as_ref().map(|f| f.as_raw_fd())
+    };
+    if let Some(fd) = vt_fd {
+        unsafe {
+            libc::signal(libc::SIGUSR1, vt_relsig as extern "C" fn(libc::c_int) as usize);
+            libc::signal(libc::SIGUSR2, vt_acqsig as extern "C" fn(libc::c_int) as usize);
+            let m = VtMode {
+                mode: VT_PROCESS,
+                waitv: 0,
+                relsig: libc::SIGUSR1 as libc::c_short,
+                acqsig: libc::SIGUSR2 as libc::c_short,
+                frsig: 0,
+            };
+            libc::ioctl(fd, VT_SETMODE, &m as *const VtMode);
+        }
+        eprintln!("vt-switch: registered on active console (chvt hands off the screens)");
+    }
+    let mut have_master = true;
+
     let mut logged = Instant::now();
     let mut frames = 0u32;
     let mut cur_fps = 0.0f64;
@@ -373,6 +420,28 @@ fn main() -> anyhow::Result<()> {
     let mut snapped = Instant::now();
 
     loop {
+        // VT switched AWAY: drop DRM master, ack the release, and idle (another owner —
+        // e.g. the desktop — now drives the screens). VT switched BACK: re-grab master,
+        // force a full re-modeset on both CRTCs, ack the acquire.
+        if VT_RELEASE.swap(false, Ordering::SeqCst) {
+            let _ = gbm.release_master_lock();
+            have_master = false;
+            if let Some(fd) = vt_fd { unsafe { libc::ioctl(fd, VT_RELDISP, 1); } }
+            eprintln!("vt-switch: released the screens");
+        }
+        if VT_ACQUIRE.swap(false, Ordering::SeqCst) {
+            let _ = gbm.acquire_master_lock();
+            have_master = true;
+            first = true; // re-run set_crtc on every connector
+            if let Some(fd) = vt_fd { unsafe { libc::ioctl(fd, VT_RELDISP, VT_ACKACQ as libc::c_ulong); } }
+            eprintln!("vt-switch: re-acquired the screens (re-modeset)");
+        }
+        if !have_master {
+            std::thread::sleep(Duration::from_millis(60));
+            last = Instant::now();
+            continue;
+        }
+
         let now = Instant::now();
         let t = start.elapsed().as_secs_f64();
         if duration > 0.0 && t > duration { break; }
@@ -461,22 +530,18 @@ fn main() -> anyhow::Result<()> {
             }
             first = false;
         } else {
-            // Mirror the fb onto every screen, but vsync to only the FIRST screen to
-            // report back. Two independent 60 Hz HDMI outputs have offset vblank phases;
-            // waiting for BOTH every frame beats them down to 30 fps. Blocking for a
-            // single completion keeps the primary at full rate; the other screen's
-            // stragglers are drained on later frames.
-            let mut queued = 0;
+            // Mirror the fb onto every screen and wait for ALL their vblank events before
+            // reusing buffers. (An earlier "wait for only the first-ready screen" trick
+            // recycled a buffer while the other CRTC was still scanning it — which
+            // flickered to black on real dual-HDMI hardware. Correct display > extra fps.)
+            let mut pending = 0;
             for (_ch, cr, _m) in &outputs {
-                if gbm.page_flip(*cr, fb, drm::control::PageFlipFlags::EVENT, None).is_ok() { queued += 1; }
+                if gbm.page_flip(*cr, fb, drm::control::PageFlipFlags::EVENT, None).is_ok() { pending += 1; }
             }
-            if queued > 0 {
-                loop {
-                    let mut ev = gbm.receive_events()?;
-                    let mut got = 0;
-                    for _e in &mut ev { got += 1; }
-                    if got > 0 { break; }
-                }
+            let mut got = 0;
+            while got < pending {
+                let mut ev = gbm.receive_events()?;
+                for _e in &mut ev { got += 1; }
             }
         }
         if let Some(old) = prev_fb.take() { let _ = gbm.destroy_framebuffer(old); }
