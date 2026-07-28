@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# flow-display — switch a Pi's HDMI between the normal desktop and the flowengine visualizer.
+#
+# flowengine is a DRM/KMS app and the desktop is a Wayland compositor (lightdm → labwc);
+# both want DRM master on the SAME HDMI outputs and cannot coexist. So this is a hard switch:
+# exactly one owns the screens at a time.
+#
+#   flow-display on            → flowengine owns the screens (stops the desktop)
+#   flow-display off           → the desktop/login owns the screens (stops flowengine)
+#   flow-display status        → show what's on the screens right now  (default; no root)
+#   flow-display boot on|off   → set which one AUTO-STARTS at boot
+#
+set -euo pipefail
+
+as_root() { [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"; }
+
+kill_desktop() {
+  systemctl stop lightdm 2>/dev/null || true
+  for p in cage labwc chromium Xwayland; do pkill -x "$p" 2>/dev/null || true; done
+  sleep 2
+}
+
+case "${1:-status}" in
+  on|flow|flowengine|visualizer)
+    as_root "$@"
+    echo "→ switching to flowengine (stopping the desktop)…"
+    kill_desktop
+    chvt 4 2>/dev/null || true
+    systemctl restart flowengine
+    sleep 3
+    if systemctl is-active --quiet flowengine; then
+      echo "✓ flowengine is on the screens"
+    else
+      echo "✗ flowengine did not start — run: journalctl -u flowengine -n 20"; exit 1
+    fi
+    ;;
+  off|desktop|gui)
+    as_root "$@"
+    echo "→ switching to the desktop (stopping flowengine)…"
+    systemctl stop flowengine 2>/dev/null || true
+    pkill -x flowengine 2>/dev/null || true
+    sleep 1
+    chvt 1 2>/dev/null || true
+    systemctl start lightdm
+    sleep 3
+    if systemctl is-active --quiet lightdm; then
+      echo "✓ desktop/login restored"
+    else
+      echo "✗ lightdm did not start — run: journalctl -u lightdm -n 20"; exit 1
+    fi
+    ;;
+  boot)
+    as_root "$@"
+    case "${2:-}" in
+      on|flow|flowengine)  systemctl enable flowengine 2>/dev/null; systemctl disable lightdm 2>/dev/null; echo "✓ boot default → flowengine" ;;
+      off|desktop|gui)     systemctl enable lightdm 2>/dev/null; systemctl disable flowengine 2>/dev/null; echo "✓ boot default → desktop" ;;
+      *) echo "usage: flow-display boot on|off"; exit 1 ;;
+    esac
+    ;;
+  status|*)
+    fe=$(systemctl is-active flowengine 2>/dev/null || true)
+    dm=$(systemctl is-active lightdm 2>/dev/null || true)
+    feb=$(systemctl is-enabled flowengine 2>/dev/null || true)
+    dmb=$(systemctl is-enabled lightdm 2>/dev/null || true)
+    echo "flowengine: $fe (boot: $feb)"
+    echo "desktop   : $dm (boot: $dmb)"
+    if   [ "$fe" = active ]; then echo "→ the VISUALIZER is on the screens"
+    elif [ "$dm" = active ]; then echo "→ the DESKTOP is on the screens"
+    else echo "→ neither is running"; fi
+    ;;
+esac
