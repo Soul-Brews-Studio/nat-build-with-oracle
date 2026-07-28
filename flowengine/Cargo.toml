@@ -1,0 +1,25 @@
+[package]
+name = "flowengine"
+version = "0.1.0"
+edition = "2021"
+description = "Native GPU engine — direct DRM/KMS scanout on Raspberry Pi VideoCore. No compositor. Audio-reactive."
+
+[[bin]]
+name = "flowengine"
+path = "src/main.rs"
+
+[dependencies]
+drm = "0.14"
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+khronos-egl = { version = "6", features = ["static"] }
+glow = "0.16"
+libc = "0.2"
+cpal = "0.15"
+ringbuf = "0.4"
+realfft = "3"
+anyhow = "1"
+font8x8 = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true

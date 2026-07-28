@@ -1,0 +1,26 @@
+[package]
+name = "flowengine-wgpu"
+version = "0.1.0"
+edition = "2021"
+description = "Audio-reactive GPU visualizer — wgpu (Metal/Vulkan) + winit port of flowengine."
+
+[[bin]]
+name = "flowengine"
+path = "src/main.rs"
+
+[dependencies]
+wgpu     = "25.0"
+winit    = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+image    = { version = "0.25", default-features = false, features = ["png"] }
+anyhow   = "1"
+
+# ported as-is from the Linux/DRM flowengine — backend-agnostic:
+cpal    = "0.15"
+ringbuf = "0.4"
+realfft = "3"
+
+[profile.release]
+opt-level = 3
+lto = true

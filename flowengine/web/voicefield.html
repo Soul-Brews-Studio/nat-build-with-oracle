@@ -1,0 +1,315 @@
+<title>Voice Field</title>
+<style>
+  :root{
+    --bg:#05070d; --cyan:#3ac8e8; --pale:#b8ecff; --amber:#ffb347;
+    --ink:#d3e8f2; --muted:#5f7a8a; --line:#16202e;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ height:100%; background:var(--bg); color:var(--ink);
+    font-family:var(--mono); overflow:hidden; -webkit-font-smoothing:antialiased; }
+  #gl{ position:fixed; inset:0; width:100vw; height:100vh; display:block; z-index:0; }
+  .hud{ position:fixed; inset:0; z-index:1; pointer-events:none;
+    display:flex; flex-direction:column; justify-content:space-between;
+    padding:clamp(16px,3.5vw,34px); }
+  .top{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+  .mark{ display:flex; align-items:center; gap:10px; }
+  .dot{ width:9px; height:9px; border-radius:50%; background:var(--cyan);
+    box-shadow:0 0 12px var(--cyan); flex:none; }
+  .mark .t1{ font-size:13px; letter-spacing:.28em; text-transform:uppercase; color:var(--ink); }
+  .mark .t2{ font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--muted); margin-top:3px; }
+  .state{ text-align:right; }
+  .state .lbl{ font-size:11px; letter-spacing:.24em; text-transform:uppercase; color:var(--muted); }
+  .state .val{ font-size:13px; letter-spacing:.24em; text-transform:uppercase; color:var(--cyan);
+    margin-top:4px; transition:color .3s; }
+  .freq{ text-align:center; }
+  .freq .lbl{ font-size:11px; letter-spacing:.24em; text-transform:uppercase; color:var(--muted); }
+  .freq .val{ font-size:15px; letter-spacing:.14em; color:var(--pale); margin-top:4px;
+    font-variant-numeric:tabular-nums; }
+  .meter{ pointer-events:none; }
+  .meter .row{ display:flex; align-items:center; gap:14px; }
+  .meter .cap{ font-size:11px; letter-spacing:.22em; text-transform:uppercase; color:var(--muted); white-space:nowrap; }
+  .bar{ position:relative; flex:1; height:2px; background:var(--line); }
+  .bar .fill{ position:absolute; left:0; top:0; height:100%;
+    background:linear-gradient(90deg,#0a4bde,var(--cyan) 60%,var(--pale));
+    box-shadow:0 0 10px var(--cyan); width:0%; }
+  .bar .peak{ position:absolute; top:-3px; width:2px; height:8px; background:var(--amber);
+    box-shadow:0 0 8px var(--amber); left:0%; opacity:0; }
+  .db{ font-variant-numeric:tabular-nums; font-size:12px; letter-spacing:.08em; color:var(--ink); min-width:5.5ch; text-align:right; }
+  .gate{ position:fixed; inset:0; z-index:2; display:grid; place-items:center;
+    background:radial-gradient(ellipse at center, rgba(8,12,22,.35), rgba(5,7,13,.86));
+    backdrop-filter:blur(2px); transition:opacity .5s; }
+  .gate.hide{ opacity:0; pointer-events:none; }
+  .card{ text-align:center; max-width:min(90vw,440px); padding:8px; }
+  .card h1{ font-size:clamp(26px,6vw,44px); font-weight:600; letter-spacing:.02em; line-height:1.05;
+    text-wrap:balance; color:var(--pale); text-shadow:0 0 30px rgba(58,200,232,.35); }
+  .card p{ font-size:13.5px; line-height:1.7; color:var(--muted); margin-top:16px; letter-spacing:.02em; }
+  .card p b{ color:var(--ink); font-weight:600; }
+  .btn{ pointer-events:auto; cursor:pointer; margin-top:28px; display:inline-flex; align-items:center; gap:12px;
+    padding:15px 28px; background:transparent; color:var(--pale); border:1px solid var(--cyan);
+    font-family:var(--mono); font-size:13px; letter-spacing:.24em; text-transform:uppercase; border-radius:2px;
+    transition:background .25s, box-shadow .25s, transform .1s; }
+  .btn:hover{ background:rgba(58,200,232,.10); box-shadow:0 0 26px rgba(58,200,232,.28); }
+  .btn:active{ transform:translateY(1px); }
+  .btn:focus-visible{ outline:2px solid var(--pale); outline-offset:3px; }
+  .btn .rig{ width:8px; height:8px; border-radius:50%; background:var(--cyan); box-shadow:0 0 12px var(--cyan);
+    animation:bpm 2.4s ease-in-out infinite; }
+  @keyframes bpm{ 0%,100%{ transform:scale(1); opacity:1 } 50%{ transform:scale(1.5); opacity:.5 } }
+  .err{ color:var(--amber); font-size:12.5px; margin-top:18px; letter-spacing:.04em; min-height:1em; }
+  .foot{ position:fixed; bottom:0; left:0; right:0; z-index:2; text-align:center; font-size:10.5px;
+    letter-spacing:.18em; text-transform:uppercase; color:var(--muted); padding:14px; pointer-events:none; }
+  @media (prefers-reduced-motion:reduce){ .btn .rig{ animation:none; } }
+</style>
+
+<canvas id="gl"></canvas>
+
+<div class="hud" aria-hidden="true">
+  <div class="top">
+    <div class="mark"><span class="dot"></span>
+      <div><div class="t1">Voice Field</div><div class="t2">reactive core · fft · webgl</div></div>
+    </div>
+    <div class="freq"><div class="lbl">peak freq</div><div class="val" id="freqVal">— Hz</div></div>
+    <div class="state"><div class="lbl">state</div><div class="val" id="stateVal">idle</div></div>
+  </div>
+  <div class="meter"><div class="row">
+    <span class="cap">level</span>
+    <div class="bar"><div class="fill" id="fill"></div><div class="peak" id="peak"></div></div>
+    <span class="db" id="db">—</span>
+  </div></div>
+</div>
+
+<div class="gate" id="gate">
+  <div class="card">
+    <h1>Speak, and the core answers.</h1>
+    <p>A live Jarvis-style core rendered on the GPU. Your voice's <b>loudness</b> swells it;
+       its <b>frequencies</b> ring it in a spectrum. Nothing leaves your device.</p>
+    <button class="btn" id="start"><span class="rig"></span> Tap to speak</button>
+    <div class="err" id="err"></div>
+  </div>
+</div>
+<div class="foot">fft spectrum ring · critically-damped spring · mic stays on-device</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('gl');
+  const gl = canvas.getContext('webgl', { antialias:false, alpha:false, powerPreference:'high-performance' });
+  if(!gl){ document.getElementById('err').textContent='WebGL not available.'; return; }
+
+  const VS = `attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }`;
+
+  // Alien Jarvis core + FFT-driven radial spectrum + sonar (matches the native engine).
+  const FS = `
+  precision highp float;
+  uniform float u_time, u_level, u_peak, u_bass;
+  uniform vec2  u_res;
+  uniform sampler2D u_spec;
+  #define TAU 6.28318530718
+  float hash21(vec2 p){ p=fract(p*vec2(123.34,345.45)); p+=dot(p,p+34.345); return fract(p.x*p.y); }
+  void main(){
+    vec2 uv=(gl_FragCoord.xy-0.5*u_res)/u_res.y;
+    float r=length(uv);
+    float ang=atan(uv.y,uv.x);
+    float t=u_time;
+    float lv=clamp(u_level,0.0,1.0);
+    float drive=max(lv,u_bass);
+    float dc=drive/(0.6+drive);
+
+    vec3 cyan=vec3(0.26,0.76,1.0);
+    vec3 pale=vec3(0.80,0.94,1.0);
+    vec3 amber=vec3(1.0,0.70,0.28);
+    vec3 alien=vec3(0.30,1.0,0.75);
+    vec3 col=vec3(0.0);
+
+    col += vec3(0.015,0.035,0.075)*(1.0-smoothstep(0.0,1.3,r));
+
+    // concentric energy waves radiating OUTWARD
+    float ws=max(sin(r*26.0 - t*3.5),0.0);
+    col += mix(cyan,alien,0.25)*ws*ws*smoothstep(0.08,0.35,r)*smoothstep(1.2,0.5,r)*(0.10+0.5*lv);
+
+    // sonar pulses expanding to the edges
+    for(int i=0;i<2;i++){
+      float ph=fract(t*0.20+float(i)*0.5);
+      float pr=ph*1.45;
+      float son=exp(-pow((r-pr)*11.0,2.0))*(1.0-ph);
+      col += cyan*son*(0.20+0.5*dc);
+    }
+
+    // core: soft heavenly white glow (present even when quiet), swells with voice
+    float breath=0.5+0.5*sin(t*0.7);
+    float coreK=30.0-11.0*dc;
+    float core=exp(-r*r*coreK);
+    float coreI=0.30+0.14*breath+0.85*dc;
+    col += mix(cyan,pale,clamp(0.35+0.45*dc,0.0,0.90))*core*coreI;
+    col += vec3(0.86,0.93,1.0)*exp(-r*r*7.0)*(0.22+0.15*breath);   // wide soft white halo (heaven)
+    col += pale*exp(-r*r*300.0)*(0.50+0.7*dc);                      // bright white pinpoint
+    float R=0.145+0.02*breath;
+    col += cyan*exp(-pow((r-R)*28.0,2.0))*(0.10+0.9*lv);
+
+    // FFT spectrum ring (static, log-frequency)
+    float aa=fract(ang/TAU+0.75);
+    float bin=pow(aa,2.0);
+    float mag=texture2D(u_spec, vec2(clamp(bin,0.003,0.997),0.5)).r;
+    mag=mag*mag;
+    float baseR=0.26, barMax=0.18, bars=108.0;
+    float slot=fract((ang/TAU)*bars);
+    float barMask=smoothstep(0.60,0.28, abs(slot-0.5)*2.0);
+    float outer=baseR+mag*barMax;
+    float inbar=step(baseR,r)*step(r,outer)*barMask;
+    col += cyan*inbar*(0.30+0.7*mag);
+    col += pale*exp(-pow((r-outer)*46.0,2.0))*barMask*mag*0.7;
+    col += cyan*exp(-pow((r-baseR)*120.0,2.0))*0.18;
+
+    // static concentric rings + FFT-DRIVEN radial emission (energy = spectrum, by freq)
+    float o1=exp(-pow((r-0.60)*70.0,2.0));
+    col += cyan*o1*(0.10+0.06*sin(t*1.5))*(0.6+0.6*lv);
+    float o2=exp(-pow((r-0.80)*60.0,2.0));
+    col += mix(cyan,alien,0.5)*o2*(0.08+0.05*sin(t*1.1+1.0));
+    float phM=fract(r*1.8 - t*1.3);
+    float pulseM=smoothstep(0.0,0.12,phM)*smoothstep(0.55,0.12,phM);
+    float spk=0.5+0.5*sin(ang*80.0);
+    col += mix(cyan,pale,0.3)*pulseM*(spk*spk*spk)*mag*smoothstep(0.16,0.4,r)*smoothstep(1.15,0.5,r)*2.4;
+
+    // PEAK HOLD — on a peak the core latches WHITE and fades out with the slow-release
+    // peak envelope (no sharp flare, no throb): "hold white, then fade".
+    float hold = u_peak*u_peak;
+    col += vec3(0.90,0.95,1.0)*exp(-r*r*4.0)*hold*0.80;    // wide soft white hold
+    col += vec3(1.0)*exp(-r*r*20.0)*hold*0.60;             // bright white heart
+    col += amber*core*smoothstep(0.65,1.0,u_peak)*0.22;    // faint warm tint only
+
+    // alien teal edge + vignette + tonemap
+    col = mix(col, col*vec3(0.7,1.15,1.0), smoothstep(0.55,1.15,r)*0.5);
+    col *= 0.4+0.6*smoothstep(1.3,0.12,r);
+    col = col/(1.0+col);
+    col = pow(col, vec3(0.85));
+    gl_FragColor=vec4(col,1.0);
+  }`;
+
+  function sh(ty,src){ const s=gl.createShader(ty); gl.shaderSource(s,src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; }
+  const prog=gl.createProgram();
+  gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));
+  gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));
+  gl.bindAttribLocation(prog,0,'p'); gl.linkProgram(prog); gl.useProgram(prog);
+
+  const buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+
+  const uTime=gl.getUniformLocation(prog,'u_time');
+  const uRes=gl.getUniformLocation(prog,'u_res');
+  const uLevel=gl.getUniformLocation(prog,'u_level');
+  const uPeak=gl.getUniformLocation(prog,'u_peak');
+  const uBass=gl.getUniformLocation(prog,'u_bass');
+  const uSpec=gl.getUniformLocation(prog,'u_spec');
+
+  // FFT spectrum texture (256 x 1, LUMINANCE)
+  const NBINS=256;
+  const specTex=gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,specTex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.LUMINANCE,NBINS,1,0,gl.LUMINANCE,gl.UNSIGNED_BYTE,new Uint8Array(NBINS));
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.uniform1i(uSpec,0);
+
+  let W=1,H=1;
+  function resize(){
+    const scale=Math.min(window.devicePixelRatio||1,1.5);
+    const maxLong=1400; let cw=window.innerWidth*scale, ch=window.innerHeight*scale;
+    const long=Math.max(cw,ch); if(long>maxLong){ const k=maxLong/long; cw*=k; ch*=k; }
+    W=Math.max(2,Math.round(cw)); H=Math.max(2,Math.round(ch));
+    canvas.width=W; canvas.height=H; gl.viewport(0,0,W,H);
+  }
+  window.addEventListener('resize',resize); resize();
+
+  // KlakMath CdsTween: implicit critically-damped spring (overshoot-free)
+  function cds(x,v,target,omega,dt){
+    const f=1.0+2.0*dt*omega, oo=omega*omega, hoo=dt*oo, hhoo=dt*hoo;
+    const det=1.0/(f+hhoo);
+    return [(f*x+dt*v+hhoo*target)*det, (v+hoo*(target-x))*det];
+  }
+
+  let analyser=null, tdata=null, fdata=null, sampleRate=48000;
+  let lx=0,lv=0, bx=0,bv=0, peakEnv=0;
+  const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const stateVal=document.getElementById('stateVal');
+  const freqEl=document.getElementById('freqVal');
+  const fillEl=document.getElementById('fill'), peakEl=document.getElementById('peak'), dbEl=document.getElementById('db');
+  const gate=document.getElementById('gate'), errEl=document.getElementById('err');
+
+  async function startAudio(){
+    try{
+      const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      const AC=window.AudioContext||window.webkitAudioContext; const ac=new AC();
+      if(ac.state==='suspended') await ac.resume();
+      sampleRate=ac.sampleRate;
+      const src=ac.createMediaStreamSource(stream);
+      analyser=ac.createAnalyser();
+      analyser.fftSize=1024; analyser.smoothingTimeConstant=0.62;  // smoothing helps the spectrum ring
+      analyser.minDecibels=-92; analyser.maxDecibels=-24;          // wider range -> bins differ, less clip-to-flat
+      tdata=new Uint8Array(analyser.fftSize);
+      fdata=new Uint8Array(analyser.frequencyBinCount);            // 512 bins
+      src.connect(analyser);
+      gate.classList.add('hide'); stateVal.textContent='listening'; stateVal.style.color='var(--cyan)';
+    }catch(e){
+      errEl.textContent=(e&&e.name==='NotAllowedError')?'Microphone permission denied. Allow it and tap again.'
+        :'Could not open the microphone: '+(e&&e.message||e);
+    }
+  }
+  document.getElementById('start').addEventListener('click', startAudio);
+  if(/[?&]auto=1/.test(location.search)) window.addEventListener('load',()=>setTimeout(startAudio,400));
+
+  function readLevel(){
+    if(!analyser) return 0;
+    analyser.getByteTimeDomainData(tdata);
+    let sum=0; for(let i=0;i<tdata.length;i++){ const s=(tdata[i]-128)/128; sum+=s*s; }
+    return Math.min(1, Math.sqrt(sum/tdata.length)*3.2);
+  }
+
+  let t0=null,last=null;
+  function frame(now){
+    if(t0===null){ t0=now; last=now; }
+    const t=(now-t0)/1000; let dt=(now-last)/1000; last=now; dt=Math.min(dt,0.05);
+
+    const raw=readLevel();
+    const omega=reduced?4.0:9.0;
+    [lx,lv]=cds(lx,lv,raw,omega,dt);
+    const level=Math.max(0,lx);
+
+    // FFT: upload spectrum + compute bass energy for the core
+    let bass=0;
+    if(analyser){
+      analyser.getByteFrequencyData(fdata);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, specTex);
+      gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,NBINS,1,gl.LUMINANCE,gl.UNSIGNED_BYTE, fdata.subarray(0,NBINS));
+      let bs=0; for(let i=1;i<=16;i++) bs+=fdata[i]; bass=Math.min(1,(bs/16)/200);
+      // peak-frequency detection (diagnostic + readout): loudest bin -> Hz
+      let maxV=0,maxI=0; for(let i=1;i<fdata.length;i++){ if(fdata[i]>maxV){ maxV=fdata[i]; maxI=i; } }
+      const hz = maxI*sampleRate/analyser.fftSize;
+      freqEl.textContent = maxV>26 ? (hz>=1000 ? (hz/1000).toFixed(2)+' kHz' : Math.round(hz)+' Hz') : '— Hz';
+    }
+    [bx,bv]=cds(bx,bv,bass,reduced?4.0:11.0,dt);
+    const bassS=Math.max(0,bx);
+
+    if(raw>peakEnv) peakEnv=raw; else peakEnv+=(raw-peakEnv)*Math.min(1,dt*1.4); // slow release → peak HOLDS then fades
+    const peak=Math.max(0,peakEnv);
+
+    gl.uniform1f(uTime,t%3600.0); gl.uniform2f(uRes,W,H);
+    gl.uniform1f(uLevel,level); gl.uniform1f(uPeak,peak); gl.uniform1f(uBass,bassS);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+
+    if(analyser){
+      const pct=Math.min(100,level*100);
+      fillEl.style.width=pct.toFixed(1)+'%';
+      peakEl.style.left=Math.min(100,peak*100).toFixed(1)+'%';
+      peakEl.style.opacity=peak>0.5?'1':'0.25';
+      dbEl.textContent=level>0.001?(20*Math.log10(level)).toFixed(0)+' dB':'−∞';
+      if(level>0.18){ stateVal.textContent='speaking'; stateVal.style.color='var(--amber)'; }
+      else { stateVal.textContent='listening'; stateVal.style.color='var(--cyan)'; }
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>

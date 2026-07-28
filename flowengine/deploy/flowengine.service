@@ -1,0 +1,18 @@
+[Unit]
+Description=flowengine — native audio-reactive GPU visualizer (dual-HDMI, DRM/KMS)
+Documentation=https://github.com/Soul-Brews-Studio/nat-build-with-oracle
+After=multi-user.target
+
+[Service]
+Type=simple
+# switch to a free VT so we hold DRM master cleanly
+ExecStartPre=-/usr/bin/chvt 4
+ExecStart=/home/pi/flowengine/target/release/flowengine /dev/dri/card1 0
+# reconstruct the user PipeWire path (main.rs reads SUDO_UID); pi uid=1000
+Environment=SUDO_UID=1000
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
