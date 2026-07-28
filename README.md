@@ -54,6 +54,13 @@ mic → cpal / Web Audio → ringbuf → realfft (Blackman, dB byte-map, critica
 
 ## Quick start
 
+**One command (auto-detects Raspberry Pi / macOS / Linux):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Soul-Brews-Studio/nat-build-with-oracle/main/install.sh | bash
+```
+It builds the right renderer for the machine and prints the opt-in step to run it. It
+never enables a display-grabbing boot service on its own. Or do it by hand:
+
 **Raspberry Pi (native framebuffer):**
 ```bash
 sudo apt install -y libasound2-dev
